@@ -1,0 +1,8 @@
+
+#frag quad.frag
+#include "quad.frag.fsl"
+#end
+
+#vert VR_MULTIVIEW quad.vert
+#include "quad.vert.fsl"
+#end

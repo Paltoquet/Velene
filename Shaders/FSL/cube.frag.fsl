@@ -1,0 +1,257 @@
+/*
+ * Copyright (c) 2017-2022 The Forge Interactive Inc.
+ * 
+ * This file is part of The-Forge
+ * (see https://github.com/ConfettiFX/The-Forge).
+ * 
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+*/
+
+#include "resources.h.fsl"
+
+#define M_PI 3.14159265359f
+
+// Shader for simple shading with a point light
+// for planets in Unit Test 12 - Transformations
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, worldPosition, POSITION);
+    DATA(float3, uv, TEXCOORD0);
+};
+
+float remap(float val, float l0, float h0, float l1, float h1)
+{
+    return l1 + (val - l0) * (h1 - l1) / (h0 - l0);
+}
+
+float3 remap(float3 val, float3 l0, float3 h0, float3 l1, float3 h1)
+{
+    return l1 + (val - l0) * (h1 - l1) / (h0 - l0);
+}
+
+float hermiteInterpolation(float x, float min, float max)
+{
+    float t = saturate((x - min) / (max - min));
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// Returns (dstToBox, dstInsideBox). If ray misses box, dstInsideBox will be zero
+float2 rayBoxDst(float3 boundsMin, float3 boundsMax, float3 rayOrigin, float3 invRaydir) {
+    // Adapted from: http://jcgt.org/published/0007/03/04/
+    float3 t0 = (boundsMin - rayOrigin) * invRaydir;
+    float3 t1 = (boundsMax - rayOrigin) * invRaydir;
+    float3 tmin = min(t0, t1);
+    float3 tmax = max(t0, t1);
+                
+    float dstA = max(max(tmin.x, tmin.y), tmin.z);
+    float dstB = min(tmax.x, min(tmax.y, tmax.z));
+
+    // CASE 1: ray intersects box from outside (0 <= dstA <= dstB)
+    // dstA is dst to nearest intersection, dstB dst to far intersection
+
+    // CASE 2: ray intersects box from inside (dstA < 0 < dstB)
+    // dstA is the dst to intersection behind the ray, dstB is dst to forward intersection
+
+    // CASE 3: ray misses box (dstA > dstB)
+
+    float dstToBox = max(0, dstA);
+    float dstInsideBox = max(0, dstB - dstToBox);
+    return float2(dstToBox, dstInsideBox);
+}
+
+// the Henyey-Greenstein phase function
+float phase(float g, float cosTheta)
+{
+   float denom = 1.0f + g * g - 2.0f * g * cosTheta;
+   return 1.0f / (4.0f * M_PI) * (1.0f - g * g) / (denom * sqrt(denom));
+}
+
+float heightFunction(float height, float hMin, float hMax)
+{
+    float min = saturate(remap(height, hMin - 0.08f, hMin, 0.0f, 1.0f));
+    float max = hMax == 1.0f ? 1.0f : saturate(remap(height, hMax + 0.15f, hMax, 0.0f, 1.0f));
+    float val =  min * max;
+    return val;
+}
+
+float horizontalFunction(float3 samplePos, float3 boxMin, float3 boxMax, float3 boxSize)
+{
+    float distX = min(samplePos.x - boxMin.x, boxMax.x - samplePos.x) / boxSize.x;
+    float distZ = min(samplePos.z - boxMin.z, boxMax.z - samplePos.z) / boxSize.y;
+    float result = min(distX, distZ);
+    result = saturate(remap(result, 0.03f, 0.22f, 0.0f, 1.0f));
+    return result;
+}
+
+float sampleDensity(float3 uv) {
+    float textureOffset = Get(shapeFunction).z;
+    uv.z += textureOffset;
+    uv.z = fmod(uv.z, 1.0f);
+    float4 noiseValue = SampleLvlTex3D(Get(CloudShape), Get(uSamplerCloud), uv, 0);
+    // extrude shapes
+    float density = saturate(remap(noiseValue.x, 1.0f - noiseValue.y, 1.0f, 0.0f, 1.0f));
+
+    float4 cloudCoverage = SampleLvlTex2D(Get(WeatherTexture), Get(uSampler1), float2(uv.x, uv.z), 0);
+    float baseCloudWithCoverage = saturate(remap(density, cloudCoverage.x, 1.0f, 0.0f, 1.0f));
+    //float baseCloudWithCoverage *= cloudCoverage.x;
+    //float baseCloudWithCoverage = density * cloudCoverage.x;
+
+    float finalCloud = baseCloudWithCoverage;
+    if(Get(detailParams).x > 0.0f) {
+        float heightTreshold = Get(detailParams).w;
+        float heightFallOff = hermiteInterpolation(uv.y, heightTreshold, heightTreshold * 1.5f);
+        float detailScale = Get(detailParams).y;
+        float detailClamp = Get(detailParams).z;
+        float detailNoise = SampleLvlTex3D(Get(CloudShape), Get(uSamplerCloud), uv * detailScale, 0).z;
+        detailNoise *= detailClamp * heightFallOff;
+        // erode base cloud with detailed one
+        finalCloud = saturate(remap(baseCloudWithCoverage, detailNoise, 1.0f, 0.0f, 1.0f));
+    }
+    return finalCloud;
+}
+
+float3 applyRandomOffset(float3 pos, float2 uv, float3 offset)
+{
+    float coef = SampleLvlTex2D(Get(BlueNoiseTexture), Get(uSampler1), float2(uv.x, uv.y), 0).x;
+    return pos + coef * offset;
+}
+
+
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    float4 color = float4(0.0f, 0.f, 0.0f, 0.0f);
+    float3 rayOrigin = Get(cameraPos);
+    float3 rayDir = In.worldPosition - rayOrigin;
+    rayDir = normalize(rayDir);
+    float3 invRayDir = 1.0f / rayDir;
+
+    float2 distToBoxInfo = rayBoxDst(Get(boxMin), Get(boxMax), rayOrigin, invRayDir);
+    float distToEntry = distToBoxInfo.x;
+    float distInside = distToBoxInfo.y;
+    float3 boxSize = Get(boxMax) - Get(boxMin);
+    float boxLength = max(max(boxSize.x, boxSize.y), boxSize.z);
+    float boxHeight = boxMax.y - boxMin.y;
+    float hMin = Get(shapeFunction).x;
+    float hMax = Get(shapeFunction).y;
+
+    float3 testDir = float3(1.0f, 0.0f, 0.0f);
+    float transmittance = 1.0f;
+    float dstTravelled = 0.0f;
+
+    // March through volume
+    if(distInside != 0.0f){
+        float cloudAbsorption = Get(lightParams).x;
+        float powderStrength = Get(lightParams).y;
+        float phaseAsymetry = Get(lightParams).z;
+        float sunBrightness = Get(lightParams.w);
+        // Directional light
+        float3 lightDir = Get(sunDir);
+        float3 invLightDir = 1.0f / lightDir;
+        float nbRaySamples = Get(samples).x;
+        float nbLightSamples = Get(samples).y;
+        float jitterOffset = Get(samples).z;
+        float stepSize = boxLength / nbRaySamples;
+        float lightStep = boxLength / nbLightSamples;
+        float3 entryPoint = rayOrigin + rayDir * distToEntry;
+
+        //float3 entryUV = remap(entryPoint, Get(boxMin), Get(boxMax), float3(0.0f, 0.0f, 0.0f), float3(1.0f, 1.0f, 1.0f));
+        //float2 choice = float2(entryUV.x, entryUV.z);
+        //entryPoint = applyRandomOffset(entryPoint, choice, rayDir * stepSize);
+
+        dstTravelled = 0.0f;
+        float3 lightColor = Get(sunColor) * sunBrightness;
+        float  cosTheta = dot(rayDir, -lightDir);
+        float3 result = float3(0.0f, 0.0f, 0.0f);
+        float  test = 0.0f;
+
+        while (dstTravelled < distInside) {
+            float3 rayPos = entryPoint + rayDir * dstTravelled;
+            float3 lightPos = rayPos - (lightDir * boxHeight * 3.0f);
+            float3 currentUV = remap(rayPos, Get(boxMin), Get(boxMax), float3(0.0f, 0.0f, 0.0f), float3(1.0f, 1.0f, 1.0f));
+            float density = sampleDensity(currentUV);
+            float heightPercentage = (rayPos.y - boxMin.y) / boxHeight;
+            float heightFunc = heightFunction(heightPercentage, hMin, hMax);
+            float horizontalFunc = horizontalFunction(rayPos, boxMin, boxMax, boxSize);
+            density *= heightFunc;
+            density *= horizontalFunc;
+                    
+            // Compute light transmission through the volume
+            if (density > 0.0f) {
+                float  lightTransmission = 1.0f;
+                float  lightPowderEffect = 1.0f;
+                float2 distToLightBox = rayBoxDst(Get(boxMin), Get(boxMax), lightPos, invLightDir);
+                float  ldistInside = distToLightBox.y;
+        
+                if(ldistInside != 0.0f) {
+                    float3 lightEntry = lightPos + lightDir * distToLightBox.x;
+                    float3 lightUV = remap(lightEntry, Get(boxMin), Get(boxMax), float3(0.0f, 0.0f, 0.0f), float3(1.0f, 1.0f, 1.0f));
+                    float2 uvOffset = float2((lightUV.x + lightUV.y) / 2.0, (lightUV.z + lightUV.y) / 2.0);
+                    lightEntry = applyRandomOffset(lightEntry, uvOffset, lightDir * lightStep * jitterOffset);
+                    float lightDistance = length(lightEntry - rayPos);
+                    float3 lSamplePos = rayPos;
+                    float  lightDensityAccumulation = 0.0f;
+                    float  lightDistanceTravelled = 0.0f;
+
+                    while(lightDistanceTravelled < lightDistance){
+                        lSamplePos = lightEntry + lightDir * lightDistanceTravelled;
+                        lightUV = remap(lSamplePos, Get(boxMin), Get(boxMax), float3(0.0f, 0.0f, 0.0f), float3(1.0f, 1.0f, 1.0f));
+
+                        float lDensity = sampleDensity(lightUV);
+                        float lightHeightPercentage = (lSamplePos.y - boxMin.y) / boxHeight;
+                        float lheightFunc = heightFunction(lightHeightPercentage, hMin, hMax);
+                        float lhorizontalFunc = horizontalFunction(lSamplePos, boxMin, boxMax, boxSize);
+                        lDensity *= lheightFunc;
+                        lDensity *= lhorizontalFunc;
+                        lightDensityAccumulation += lDensity;
+                        lightDistanceTravelled += lightStep;
+                    }
+                    // Sum of exp(-step * density * absorp) -> exp(-step * SumDensity * absorn)  || exp(a) * exp(b) = exp(a+b);
+                    //lightTransmission = exp(-1.0f * lightStep * lightDensityAccumulation * (cloudAbsorption + outScaterringCoefficient));
+                    lightTransmission = exp(-1.0f * lightStep * lightDensityAccumulation * cloudAbsorption);
+                    // Reduce in scattering when no particapating medium is found (inverse of Beer's law)
+                    lightPowderEffect = 1.0f - powderStrength * exp(-1.0f * lightStep * lightDensityAccumulation * cloudAbsorption * 2.0f);
+                    lightPowderEffect = 2.0f * lightPowderEffect;
+                    lightTransmission *= lightPowderEffect;
+                }
+                
+                transmittance *= exp(-density * stepSize * cloudAbsorption);
+                //                  LightEnergy            RiemanSum          Beer's law               InScattering                 OutScattering
+                //result += lightColor * lightTransmission * stepSize *   density * transmittance * phase(phaseAsymetry, cosTheta) * outScaterringCoefficient;
+                result += lightColor * lightTransmission * stepSize *   density   * transmittance * phase(phaseAsymetry, cosTheta);
+
+                // Exit early if T is close to zero as further samples won't affect the result much
+                if (transmittance < 0.025f) {
+                    break;
+                }
+            }
+            dstTravelled += stepSize;
+        }
+
+        color = float4(result.x, result.y, result.z, 1.0 - transmittance);
+
+        //float p = SampleLvlTex2D(Get(BlueNoiseTexture), Get(uSampler1), float2(0, 0), 0).x;
+        //float c = sampleDensity(float3(0.0f, 0.0f, 0.0f));
+        //float3 wpos = normalize(In.worldPosition);
+        //color = float4(testDir.x, testDir.y, testDir.z, 1.0f);
+    }
+
+    RETURN(color);
+}
