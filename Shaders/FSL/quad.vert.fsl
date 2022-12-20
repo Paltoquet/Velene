@@ -33,6 +33,7 @@ STRUCT(VSInput)
 STRUCT(VSOutput)
 {
 	DATA(float4, Position, SV_Position);
+    DATA(float3, lookingDirection, Direction);
 	DATA(float2, uv, TEXCOORD0);
 };
 
@@ -46,9 +47,17 @@ VSOutput VS_MAIN( VSInput In, SV_InstanceID(uint) InstanceID )
 #else
     float4x4 tempMat = mul(Get(mvp), Get(toWorld));
 #endif
-    Out.Position = mul(tempMat, float4(In.Position.xyz, 1.0f));
-    //Out.Position = float4(In.Position.xyz, 1.0f);
+    //Out.Position = mul(tempMat, float4(In.Position.xyz, 1.0f));
+
+
+    float4 worldPosition = mul(Get(invModelViewProj), float4(In.Position.xy, 0.0f, 1.0f));
+    Out.Position = float4(In.Position.xyz, 1.0f);
+    Out.lookingDirection = normalize(worldPosition.xyz);
     Out.uv = In.Uv;
+
+
+
+
     //Out.uv = float2(In.Position.x, In.Position.y);
 
     RETURN(Out);

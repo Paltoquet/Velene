@@ -30,14 +30,80 @@
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
+    DATA(float3, lookingDirection, Direction);
     DATA(float2, uv, TEXCOORD0);
 };
 
 float4 PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
-    float3 cPos = Get(cameraPos);
+    float3 cPos = Get(cameraPos) + float3(0.0, 6360001, 0);
     float3 samplingPos = float3(In.uv.x, In.uv.y, 0.0);
-    float4 color = float4(In.uv.x, In.uv.y, 0.0, 1.0);
+    float4 color = float4(In.lookingDirection.x, In.lookingDirection.y, In.lookingDirection.z, 1.0 + cPos.z);
+
+    int numSamples = 16; 
+    int numSamplesLight = 8;
+    float earthRadius = 6360000.0;
+    float atmosphereRadius = 6420000.0;
+    float heightRayleigh = 7994.0;
+    float heightMie = 1200;
+    float distToSky = raySphereIntersectNearest(cPos, In.lookingDirection, float3(0.0, 0.0, 0.0), atmosphereRadius);
+    float3 sunDirection = float3(0.0, 1.0, 0.0);
+    float3 rayleighScatteringCoef = float3(3.8e-6, 13.5e-6, 33.1e-6);
+    float3 mieScatteringCoef = float3(21e-6f, 21e-6f, 21e-6f);
+    float3 radiance = float3(0.0, 0.0, 0.0);
+    float lightBrightness = 20.0;
+
+    float g = 0.76;
+    float mu = dot(In.lookingDirection, sunDirection);
+    float phaseR = 3.f / (16.f * M_PI) * (1 + mu * mu); 
+    float phaseM = 3.f / (8.f * M_PI) * ((1.f - g * g) * (1.f + mu * mu)) / ((2.f + g * g) * pow(1.f + g * g - 2.f * g * mu, 1.5f)); 
+
+    if(distToSky > 0.0f){
+        float offset = distToSky / numSamples;
+        float opticalDepthR = 0.0;
+        float opticalDepthM = 0.0;
+        float3 sumR = float3(0.0, 0.0, 0.0);
+        float3 sumM = float3(0.0, 0.0, 0.0);
+
+        for (int i = 0; i < numSamples; ++i) { 
+            float3 samplePosition = cPos + (i * offset) * In.lookingDirection;
+            float height = length(samplePosition) - earthRadius;
+
+            //  optical depth, Extinction coefficient -> accumulation by computing the Rayleigh/Mie scattering from each segment
+            float hr = exp(-height / heightRayleigh) * offset; 
+            float hm = exp(-height / heightMie) * offset; 
+            opticalDepthR += hr;
+            opticalDepthM += hm;
+
+            // Light RayMarching
+            float lightDist = raySphereIntersectNearest(samplePosition, sunDirection, float3(0.0, 0.0, 0.0), atmosphereRadius); 
+            float lightOffset = lightDist / numSamplesLight;
+            float opticalDepthLightR = 0.0;
+            float opticalDepthLightM = 0.0;
+            int j = 0;
+            for (j = 0; j < numSamplesLight; ++j) { 
+                float3 samplePositionLight = samplePosition + (j * lightOffset) * sunDirection; 
+                float heightLight = length(samplePositionLight) - earthRadius; 
+                if (heightLight < 0) break; 
+                opticalDepthLightR += exp(-heightLight / heightRayleigh) * lightOffset;
+                opticalDepthLightM += exp(-heightLight / heightMie) * lightOffset;
+            } 
+
+            if (j == numSamplesLight) { 
+                // Transmittance(C, Atmosphere) = exp(-(extinctionRatioRayleigh + extinctionMie))
+                // Transmittance(C, Sun) = exp(-(extinctionRatioRayleigh + extinctionMie))
+                // Tranmisttance = Transmittance(C, Atmosphere) * Transmittance(C, Sun) = exp(a) * exp(b) = exp(a+b);
+                float3 transmittance = rayleighScatteringCoef * (opticalDepthR + opticalDepthLightR) + mieScatteringCoef * 1.1f * (opticalDepthM + opticalDepthLightM);
+                float3 attenuation = float3(exp(-transmittance.x), exp(-transmittance.y), exp(-transmittance.z));
+                sumR += attenuation * hr;
+                sumM += attenuation * hm;
+            }
+        }
+        // The final radiance is the amount of light applied with the phase function of each scattering behavior (Rayliegh and Mie)
+        radiance = (sumR * rayleighScatteringCoef * phaseR + sumM * mieScatteringCoef * phaseM) * lightBrightness;
+    }
+
+    color = float4(radiance.x, radiance.y, radiance.z, 1.0);
     RETURN(color);
 }

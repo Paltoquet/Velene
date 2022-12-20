@@ -61,6 +61,8 @@ struct UniformBlock
 {
 	CameraMatrix mProjectView;
 	mat4 mToWorldMat;
+	mat4 mModelViewProj;
+	mat4 mInvModelViewProj;
 
 	// Point Light Information
 	vec3 mCameraPos;
@@ -135,7 +137,7 @@ DECLARE_RENDERER_FUNCTION(void, unmapBuffer, Renderer* pRenderer, Buffer* pBuffe
 FontDrawDesc gFrameTimeDraw; 
 
 const float quadPoints[] = {
-	// z positive							/* uv */	
+	 // z positive							/* uv */	
 	-1.0f,   1.0f,   1.0f,					0.0f, 0.0f,
 	 1.0f,  -1.0f,   1.0f,					1.0f, 1.0f,
 	 1.0f,   1.0f,   1.0f,					1.0f, 0.0f,
@@ -541,8 +543,11 @@ public:
 		const vec3 scaleFactor = vec3(220.0f, 160.0f, 220.0f);
 
 		CameraMatrix projMat = CameraMatrix::perspectiveReverseZ(horizontal_fov, aspectInverse, 0.1f, 10000.0f);
+		mat4 mvp = projMat.getPrimaryMatrix() * viewMat;
 		gUniformData.mProjectView = projMat * viewMat;
 		gUniformData.mToWorldMat = mat4::identity(); // mat4::scale(scaleFactor);
+		gUniformData.mModelViewProj = mvp;
+		gUniformData.mInvModelViewProj = inverse(mvp);
 		// point light parameters
 		gUniformData.mCameraPos = pCameraController->getViewPosition();
 
